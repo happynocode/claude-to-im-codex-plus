@@ -66,6 +66,29 @@ npm install
 npm run build
 ```
 
+## 快速演示
+
+当 bridge 配好并启动后，Discord 里可以这样实际使用：
+
+```text
+/new /path/to/project -p default -s danger-full-access -a never --search
+/providers
+/use-provider default
+/skills
+/use-skill pua
+/progress verbose
+/sandbox
+/approval on-request
+/search live
+帮我给这个仓库做一个 Discord 进度面板
+```
+
+这样你就能得到：
+
+- 来自 `cc-switch` 的 provider 选择
+- 按聊天固定的 skill
+- Discord 里更透明的 Codex 进度提示
+
 ## Discord 命令示例
 
 ```text
@@ -74,6 +97,7 @@ npm run build
 /use-provider default
 /skills
 /use-skill pua
+/progress verbose
 /sandbox
 /approval on-request
 /search live

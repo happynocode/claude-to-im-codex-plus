@@ -5,6 +5,7 @@ import {
   NEW_SESSION_COMMAND_USAGE,
   parseApprovalPolicyOverride,
   parseNewSessionCommandArgs,
+  parseProgressModeOverride,
   parseSandboxOverride,
   parseWebSearchModeOverride,
 } from '../../node_modules/claude-to-im/src/lib/bridge/security/validators.js';
@@ -55,5 +56,11 @@ describe('setting override parsers', () => {
   it('parses search value and rejects invalid choice', () => {
     assert.deepEqual(parseWebSearchModeOverride('cached'), { value: 'cached' });
     assert.equal(parseWebSearchModeOverride('banana').error, 'Invalid search mode: banana');
+  });
+
+  it('parses progress value and default reset', () => {
+    assert.deepEqual(parseProgressModeOverride('verbose'), { value: 'verbose' });
+    assert.deepEqual(parseProgressModeOverride('default'), { clear: true });
+    assert.equal(parseProgressModeOverride('banana').error, 'Invalid progress mode: banana');
   });
 });

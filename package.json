@@ -1,6 +1,6 @@
 {
   "name": "claude-to-im-codex-plus",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Enhanced claude-to-im skill with Discord session controls, cc-switch provider selection, skill pinning, and clearer progress updates",
   "type": "module",
   "scripts": {

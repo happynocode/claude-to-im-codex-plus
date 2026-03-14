@@ -72,10 +72,12 @@ describe('JsonFileStore', () => {
       codepilotSessionId: 'sess-1',
       workingDirectory: '/tmp',
       model: 'model-1',
+      progressMode: 'verbose',
     });
     assert.ok(b1.id);
     assert.equal(b1.channelType, 'telegram');
     assert.equal(b1.chatId, '123');
+    assert.equal(b1.progressMode, 'verbose');
 
     // Upsert same channel+chat should update
     const b2 = store.upsertChannelBinding({
@@ -84,9 +86,11 @@ describe('JsonFileStore', () => {
       codepilotSessionId: 'sess-2',
       workingDirectory: '/tmp/new',
       model: 'model-2',
+      progressMode: 'quiet',
     });
     assert.equal(b2.id, b1.id);
     assert.equal(b2.codepilotSessionId, 'sess-2');
+    assert.equal(b2.progressMode, 'quiet');
   });
 
   it('upsertChannelBinding uses default mode from settings', () => {

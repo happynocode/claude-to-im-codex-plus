@@ -66,6 +66,29 @@ npm install
 npm run build
 ```
 
+## Quick Demo
+
+After the bridge is configured and running, this is a realistic Discord flow:
+
+```text
+/new /path/to/project -p default -s danger-full-access -a never --search
+/providers
+/use-provider default
+/skills
+/use-skill pua
+/progress verbose
+/sandbox
+/approval on-request
+/search live
+Build a Discord progress panel for this repo
+```
+
+This gives you:
+
+- provider selection from `cc-switch`
+- pinned skill behavior per chat
+- more transparent Codex progress updates in Discord
+
 ## Example Discord Commands
 
 ```text
@@ -74,6 +97,7 @@ npm run build
 /use-provider default
 /skills
 /use-skill pua
+/progress verbose
 /sandbox
 /approval on-request
 /search live

@@ -404,6 +404,7 @@ export class JsonFileStore implements BridgeStore {
         sandboxMode: data.sandboxMode,
         approvalPolicy: data.approvalPolicy,
         webSearchMode: data.webSearchMode,
+        progressMode: data.progressMode,
         updatedAt: now(),
       };
       this.bindings.set(key, updated);
@@ -421,6 +422,7 @@ export class JsonFileStore implements BridgeStore {
       sandboxMode: data.sandboxMode,
       approvalPolicy: data.approvalPolicy,
       webSearchMode: data.webSearchMode,
+      progressMode: data.progressMode,
       mode: (this.settings.get('bridge_default_mode') as 'code' | 'plan' | 'ask') || 'code',
       active: true,
       createdAt: now(),
