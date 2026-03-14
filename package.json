@@ -1,0 +1,39 @@
+{
+  "name": "claude-to-im-codex-plus",
+  "version": "0.1.0",
+  "description": "Enhanced claude-to-im skill with Discord session controls, cc-switch provider selection, skill pinning, and clearer progress updates",
+  "type": "module",
+  "scripts": {
+    "postinstall": "patch-package",
+    "build": "node scripts/build.js",
+    "typecheck": "tsc --noEmit",
+    "dev": "tsx src/main.ts",
+    "test": "CTI_HOME=$(mktemp -d) node --test --import tsx --test-timeout=15000 src/__tests__/*.test.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/happynocode/claude-to-im-codex-plus.git"
+  },
+  "homepage": "https://github.com/happynocode/claude-to-im-codex-plus#readme",
+  "bugs": {
+    "url": "https://github.com/happynocode/claude-to-im-codex-plus/issues"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.62",
+    "claude-to-im": "https://codeload.github.com/op7418/claude-to-im/tar.gz/18c367379ef74587fe54f531538664a578a5f476"
+  },
+  "optionalDependencies": {
+    "@openai/codex-sdk": "^0.110.0"
+  },
+  "devDependencies": {
+    "@types/markdown-it": "^14.1.2",
+    "@types/node": "^22",
+    "esbuild": "^0.25.0",
+    "patch-package": "^8.0.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

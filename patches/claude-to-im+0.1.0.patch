@@ -1,0 +1,1629 @@
+diff --git a/node_modules/claude-to-im/src/lib/bridge/bridge-manager.ts b/node_modules/claude-to-im/src/lib/bridge/bridge-manager.ts
+index 1f012c5..c7bf4d7 100644
+--- a/node_modules/claude-to-im/src/lib/bridge/bridge-manager.ts
++++ b/node_modules/claude-to-im/src/lib/bridge/bridge-manager.ts
+@@ -7,7 +7,12 @@
+  * Uses globalThis to survive Next.js HMR in development.
+  */
+ 
+-import type { BridgeStatus, InboundMessage, OutboundMessage, StreamingPreviewState } from './types.js';
++import fs from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++
++import type { BridgeApiProvider } from './host.js';
++import type { BridgeStatus, ChannelBinding, InboundMessage, InlineButton, OutboundMessage, StreamingPreviewState } from './types.js';
+ import { createAdapter, getRegisteredTypes } from './channel-adapter.js';
+ import type { BaseChannelAdapter } from './channel-adapter.js';
+ // Side-effect import: triggers self-registration of all adapter factories
+@@ -21,11 +26,22 @@ import { markdownToDiscordChunks } from './markdown/discord.js';
+ import { getBridgeContext } from './context.js';
+ import { escapeHtml } from './adapters/telegram-utils.js';
+ import {
++  APPROVAL_COMMAND_USAGE,
++  APPROVAL_POLICY_OPTIONS,
++  NEW_SESSION_COMMAND_USAGE,
++  SANDBOX_COMMAND_USAGE,
++  SANDBOX_MODE_OPTIONS,
++  SEARCH_COMMAND_USAGE,
++  WEB_SEARCH_MODE_OPTIONS,
+   validateWorkingDirectory,
+   validateSessionId,
+   isDangerousInput,
+   sanitizeInput,
+   validateMode,
++  parseApprovalPolicyOverride,
++  parseNewSessionCommandArgs,
++  parseSandboxOverride,
++  parseWebSearchModeOverride,
+ } from './security/validators.js';
+ 
+ const GLOBAL_KEY = '__bridge_manager__';
+@@ -59,6 +75,601 @@ function getStreamConfig(channelType = 'telegram'): StreamConfig {
+   return { intervalMs, minDeltaChars, maxChars };
+ }
+ 
++type ConfigurableSetting = 'sandbox' | 'approval' | 'search';
++
++interface SettingCommandResult {
++  response: string;
++  responseButtons?: InlineButton[][];
++}
++
++interface SkillInfo {
++  name: string;
++  source: 'codex' | 'claude';
++  relativePath: string;
++  description?: string;
++}
++
++type SkillsRuntime = 'codex' | 'claude' | 'auto';
++
++function listConfiguredProviders(): BridgeApiProvider[] {
++  return getBridgeContext().store.listProviders();
++}
++
++function getDefaultProviderIdLabel(): string {
++  return getBridgeContext().store.getDefaultProviderId() || 'none';
++}
++
++function findConfiguredProvider(providerId: string): BridgeApiProvider | undefined {
++  const normalized = providerId.trim();
++  if (!normalized) return undefined;
++  const lower = normalized.toLowerCase();
++  return listConfiguredProviders().find((provider) => {
++    const providerName = typeof provider.name === 'string' ? provider.name : '';
++    return provider.id === normalized || providerName.toLowerCase() === lower;
++  });
++}
++
++function buildProvidersResponse(): string {
++  const providers = listConfiguredProviders();
++  const defaultProviderId = getDefaultProviderIdLabel();
++  const lines = ['<b>Available Providers</b>', '', `Default: <code>${escapeHtml(defaultProviderId)}</code>`];
++
++  if (providers.length === 0) {
++    lines.push('');
++    lines.push('No Codex providers were found in <code>~/.cc-switch/cc-switch.db</code>.');
++    return lines.join('\n');
++  }
++
++  lines.push('');
++  for (const provider of providers) {
++    const label = provider.id === defaultProviderId ? ' (default)' : '';
++    const baseUrl = typeof provider.baseUrl === 'string' ? ` — ${escapeHtml(provider.baseUrl)}` : '';
++    const providerName = typeof provider.name === 'string' ? provider.name : provider.id;
++    lines.push(`- <code>${escapeHtml(providerName)}</code> <i>(${escapeHtml(provider.id)})</i>${escapeHtml(label)}${baseUrl}`);
++  }
++  lines.push('');
++  lines.push('Create a session with one using <code>/new /path -p provider_id</code>.');
++  lines.push('Or switch the current session with <code>/use-provider provider_id</code>.');
++  return lines.join('\n');
++}
++
++function getEffectiveApprovalPolicy(binding: ChannelBinding): string {
++  return binding.approvalPolicy || (binding.mode === 'code' ? 'on-failure' : 'on-request');
++}
++
++function getSettingLabel(setting: ConfigurableSetting): string {
++  switch (setting) {
++    case 'sandbox': return 'Sandbox';
++    case 'approval': return 'Approval';
++    case 'search': return 'Search';
++  }
++}
++
++function getSettingUsage(setting: ConfigurableSetting): string {
++  switch (setting) {
++    case 'sandbox': return SANDBOX_COMMAND_USAGE;
++    case 'approval': return APPROVAL_COMMAND_USAGE;
++    case 'search': return SEARCH_COMMAND_USAGE;
++  }
++}
++
++function getSettingCurrentValue(binding: ChannelBinding, setting: ConfigurableSetting): string {
++  switch (setting) {
++    case 'sandbox':
++      return binding.sandboxMode || 'default';
++    case 'approval':
++      return binding.approvalPolicy || ('default (' + getEffectiveApprovalPolicy(binding) + ')');
++    case 'search':
++      return binding.webSearchMode || 'default';
++  }
++}
++
++function getSettingOptions(setting: ConfigurableSetting): string[] {
++  switch (setting) {
++    case 'sandbox':
++      return ['default', ...SANDBOX_MODE_OPTIONS];
++    case 'approval':
++      return ['default', ...APPROVAL_POLICY_OPTIONS];
++    case 'search':
++      return ['default', ...WEB_SEARCH_MODE_OPTIONS];
++  }
++}
++
++function getSettingInlineButtons(setting: ConfigurableSetting): InlineButton[][] {
++  switch (setting) {
++    case 'sandbox':
++      return [
++        [
++          { text: 'Default', callbackData: 'cfg:sandbox:default' },
++          { text: 'Read Only', callbackData: 'cfg:sandbox:read-only' },
++        ],
++        [
++          { text: 'Workspace', callbackData: 'cfg:sandbox:workspace-write' },
++          { text: 'Danger', callbackData: 'cfg:sandbox:danger-full-access' },
++        ],
++      ];
++    case 'approval':
++      return [
++        [
++          { text: 'Default', callbackData: 'cfg:approval:default' },
++          { text: 'Never', callbackData: 'cfg:approval:never' },
++        ],
++        [
++          { text: 'On Request', callbackData: 'cfg:approval:on-request' },
++          { text: 'On Failure', callbackData: 'cfg:approval:on-failure' },
++        ],
++        [
++          { text: 'Untrusted', callbackData: 'cfg:approval:untrusted' },
++        ],
++      ];
++    case 'search':
++      return [
++        [
++          { text: 'Default', callbackData: 'cfg:search:default' },
++          { text: 'Live', callbackData: 'cfg:search:live' },
++          { text: 'Cached', callbackData: 'cfg:search:cached' },
++        ],
++        [
++          { text: 'Disabled', callbackData: 'cfg:search:disabled' },
++        ],
++      ];
++  }
++}
++
++function buildSettingPanel(binding: ChannelBinding, setting: ConfigurableSetting, note?: string): SettingCommandResult {
++  const label = getSettingLabel(setting);
++  const lines: string[] = [];
++  if (note) {
++    lines.push(escapeHtml(note), '');
++  }
++  lines.push('<b>' + label + ' Setting</b>');
++  lines.push('Current: <code>' + escapeHtml(getSettingCurrentValue(binding, setting)) + '</code>');
++  lines.push('Available: ' + getSettingOptions(setting).map(value => '<code>' + escapeHtml(value) + '</code>').join(', '));
++  lines.push('');
++  lines.push('Tap a button below or send <code>' + escapeHtml(getSettingUsage(setting).replace('Usage: ', '')) + '</code>.');
++  return {
++    response: lines.join('\n'),
++    responseButtons: getSettingInlineButtons(setting),
++  };
++}
++
++function getSkillsRuntime(): SkillsRuntime {
++  const runtime = process.env.CTI_RUNTIME;
++  if (runtime === 'codex' || runtime === 'claude' || runtime === 'auto') {
++    return runtime;
++  }
++  return 'claude';
++}
++
++function getSkillRoots(runtime: SkillsRuntime): Array<{ source: 'codex' | 'claude'; root: string }> {
++  const home = os.homedir();
++  if (runtime === 'codex') {
++    return [{ source: 'codex', root: path.join(home, '.codex', 'skills') }];
++  }
++  if (runtime === 'claude') {
++    return [{ source: 'claude', root: path.join(home, '.claude', 'skills') }];
++  }
++  return [
++    { source: 'codex', root: path.join(home, '.codex', 'skills') },
++    { source: 'claude', root: path.join(home, '.claude', 'skills') },
++  ];
++}
++
++function extractSkillMetadata(skillPath: string): { name: string; description?: string } {
++  const fallbackName = path.basename(path.dirname(skillPath));
++  try {
++    const content = fs.readFileSync(skillPath, 'utf8');
++    const frontmatter = content.match(/^---\n([\s\S]*?)\n---/);
++    if (!frontmatter) {
++      return { name: fallbackName };
++    }
++
++    let name = fallbackName;
++    let description: string | undefined;
++    for (const rawLine of frontmatter[1].split('\n')) {
++      const line = rawLine.trim();
++      if (line.startsWith('name:')) {
++        name = line.slice(5).trim().replace(/^['"]|['"]$/g, '') || fallbackName;
++      }
++      if (line.startsWith('description:')) {
++        const value = line.slice(12).trim();
++        if (value && value !== '|' && value !== '>') {
++          description = value.replace(/^['"]|['"]$/g, '');
++        }
++      }
++    }
++
++    return { name, ...(description ? { description } : {}) };
++  } catch {
++    return { name: fallbackName };
++  }
++}
++
++function collectSkillFiles(root: string): string[] {
++  if (!fs.existsSync(root)) return [];
++
++  const results: string[] = [];
++  const queue = [root];
++  while (queue.length > 0) {
++    const current = queue.shift()!;
++    let entries: fs.Dirent[];
++    try {
++      entries = fs.readdirSync(current, { withFileTypes: true });
++    } catch {
++      continue;
++    }
++
++    for (const entry of entries) {
++      const fullPath = path.join(current, entry.name);
++      if (entry.isDirectory()) {
++        queue.push(fullPath);
++      } else if (entry.isFile() && entry.name === 'SKILL.md') {
++        results.push(fullPath);
++      }
++    }
++  }
++
++  return results;
++}
++
++export function listAvailableSkills(runtime: SkillsRuntime = getSkillsRuntime()): SkillInfo[] {
++  const seen = new Set<string>();
++  const skills: SkillInfo[] = [];
++
++  for (const { source, root } of getSkillRoots(runtime)) {
++    for (const skillPath of collectSkillFiles(root)) {
++      const relativePath = path.relative(root, skillPath);
++      const { name, description } = extractSkillMetadata(skillPath);
++      const dedupKey = `${source}:${relativePath}`;
++      if (seen.has(dedupKey)) continue;
++      seen.add(dedupKey);
++      skills.push({
++        name,
++        source,
++        relativePath,
++        ...(description ? { description } : {}),
++      });
++    }
++  }
++
++  return skills.sort((left, right) => {
++    if (left.source !== right.source) return left.source.localeCompare(right.source);
++    return left.name.localeCompare(right.name);
++  });
++}
++
++function buildSkillsResponse(): string {
++  const runtime = getSkillsRuntime();
++  const skills = listAvailableSkills(runtime);
++  const title = runtime === 'auto' ? 'Available Skills (auto runtime)' : `Available Skills (${runtime})`;
++
++  if (skills.length === 0) {
++    return [
++      `<b>${escapeHtml(title)}</b>`,
++      '',
++      'No skills found in the current runtime skill directories.',
++    ].join('\n');
++  }
++
++  const lines = [`<b>${escapeHtml(title)}</b>`, ''];
++  for (const skill of skills) {
++    const sourceLabel = runtime === 'auto' ? ` [${skill.source}]` : '';
++    const description = skill.description ? ` — ${escapeHtml(skill.description)}` : '';
++    lines.push(`- <code>${escapeHtml(skill.name)}</code>${escapeHtml(sourceLabel)}${description}`);
++  }
++  lines.push('');
++  lines.push('Use <code>/use-skill pua</code> to bind one to this chat, or mention a skill name directly in your next message.');
++  lines.push('Example: <code>请用 pua skill 继续处理这个问题</code>');
++  return lines.join('\n');
++}
++
++const USE_SKILL_COMMAND_USAGE = 'Usage: /use-skill <skill_name>';
++const USE_PROVIDER_COMMAND_USAGE = 'Usage: /use-provider <provider_id_or_name>';
++
++function normalizeRequestedSkillName(rawName: string): string {
++  let normalized = rawName.trim();
++  if (normalized.startsWith('$')) {
++    normalized = normalized.slice(1);
++  }
++  normalized = normalized.replace(/\s+skill$/i, '').trim();
++  return normalized;
++}
++
++function findSkillByName(rawName: string): SkillInfo | undefined {
++  const normalized = normalizeRequestedSkillName(rawName).toLowerCase();
++  if (!normalized) return undefined;
++  return listAvailableSkills().find(skill => skill.name.toLowerCase() === normalized);
++}
++
++function chunkInlineButtons(buttons: InlineButton[], size: number): InlineButton[][] {
++  const rows: InlineButton[][] = [];
++  for (let index = 0; index < buttons.length; index += size) {
++    rows.push(buttons.slice(index, index + size));
++  }
++  return rows;
++}
++
++function buildSkillSelectionButtons(skills: SkillInfo[]): InlineButton[][] {
++  const skillButtons = skills.slice(0, 20).map((skill) => ({
++    text: skill.name.slice(0, 24),
++    callbackData: 'skill:use:' + encodeURIComponent(skill.name),
++  }));
++  const rows = chunkInlineButtons(skillButtons, 4);
++  rows.push([{ text: 'Clear', callbackData: 'skill:clear' }]);
++  return rows;
++}
++
++function buildUseSkillPanel(binding: ChannelBinding, note?: string): SettingCommandResult {
++  const skills = listAvailableSkills();
++  const lines: string[] = [];
++  if (note) {
++    lines.push(escapeHtml(note), '');
++  }
++  lines.push('<b>Preferred Skill</b>');
++  lines.push('Current: <code>' + escapeHtml(binding.preferredSkill || 'none') + '</code>');
++  if (skills.length === 0) {
++    lines.push('');
++    lines.push('No skills found for the current runtime.');
++    return { response: lines.join('\n') };
++  }
++  lines.push('Available: ' + skills.map(skill => '<code>' + escapeHtml(skill.name) + '</code>').join(', '));
++  lines.push('');
++  lines.push('Tap a button below or send <code>' + escapeHtml(USE_SKILL_COMMAND_USAGE.replace('Usage: ', '')) + '</code>.');
++  return {
++    response: lines.join('\n'),
++    responseButtons: buildSkillSelectionButtons(skills),
++  };
++}
++
++function buildUseSkillCommandResult(binding: ChannelBinding, rawArgs: string): SettingCommandResult {
++  if (!rawArgs.trim()) {
++    return buildUseSkillPanel(binding);
++  }
++
++  const requested = normalizeRequestedSkillName(rawArgs);
++  if (!requested) {
++    return buildUseSkillPanel(binding, 'Missing skill name.');
++  }
++  if (requested === 'clear' || requested === 'none' || requested === 'default') {
++    router.updateBinding(binding.id, { preferredSkill: undefined });
++    return { response: 'Preferred skill cleared.' };
++  }
++
++  const skill = findSkillByName(requested);
++  if (!skill) {
++    return buildUseSkillPanel(binding, 'Skill not found: ' + requested);
++  }
++
++  router.updateBinding(binding.id, { preferredSkill: skill.name });
++  return {
++    response: 'Preferred skill set to <code>' + escapeHtml(skill.name) + '</code>. Future messages in this chat will mention it automatically.',
++  };
++}
++
++function buildCurrentSkillResponse(binding: ChannelBinding): string {
++  if (!binding.preferredSkill) {
++    return 'No preferred skill set. Use <code>/use-skill</code> to choose one.';
++  }
++  return 'Current preferred skill: <code>' + escapeHtml(binding.preferredSkill) + '</code>.';
++}
++
++function getCurrentProviderState(binding: ChannelBinding): { id: string; name: string; inherited: boolean } {
++  const session = getBridgeContext().store.getSession(binding.codepilotSessionId);
++  const explicitProviderId = session?.provider_id || '';
++  const effectiveProviderId = explicitProviderId || getDefaultProviderIdLabel();
++  const provider = explicitProviderId ? findConfiguredProvider(explicitProviderId) : undefined;
++  return {
++    id: effectiveProviderId,
++    name: provider?.name || effectiveProviderId,
++    inherited: !explicitProviderId,
++  };
++}
++
++function buildProviderSelectionButtons(providers: BridgeApiProvider[]): InlineButton[][] {
++  const providerButtons = providers.slice(0, 20).map((provider) => ({
++    text: (typeof provider.name === 'string' ? provider.name : provider.id).slice(0, 24),
++    callbackData: 'provider:use:' + encodeURIComponent(provider.id),
++  }));
++  const rows = chunkInlineButtons(providerButtons, 3);
++  rows.push([{ text: 'Clear', callbackData: 'provider:clear' }]);
++  return rows;
++}
++
++function buildUseProviderPanel(binding: ChannelBinding, note?: string): SettingCommandResult {
++  const providers = listConfiguredProviders();
++  const current = getCurrentProviderState(binding);
++  const lines: string[] = [];
++  if (note) {
++    lines.push(escapeHtml(note), '');
++  }
++  lines.push('<b>Session Provider</b>');
++  lines.push(`Current: <code>${escapeHtml(current.name)}</code> <i>(${escapeHtml(current.id)})</i>${current.inherited ? ' [default]' : ''}`);
++  if (providers.length === 0) {
++    lines.push('');
++    lines.push('No providers found for Codex in <code>~/.cc-switch/cc-switch.db</code>.');
++    return { response: lines.join('\n') };
++  }
++  lines.push('Available: ' + providers.map((provider) => {
++    const providerName = typeof provider.name === 'string' ? provider.name : provider.id;
++    return `<code>${escapeHtml(providerName)}</code>`;
++  }).join(', '));
++  lines.push('');
++  lines.push('Tap a button below or send <code>' + escapeHtml(USE_PROVIDER_COMMAND_USAGE.replace('Usage: ', '')) + '</code>.');
++  return {
++    response: lines.join('\n'),
++    responseButtons: buildProviderSelectionButtons(providers),
++  };
++}
++
++function buildUseProviderCommandResult(binding: ChannelBinding, rawArgs: string): SettingCommandResult {
++  if (!rawArgs.trim()) {
++    return buildUseProviderPanel(binding);
++  }
++
++  const requested = rawArgs.trim();
++  if (requested === 'clear' || requested === 'default' || requested === 'none') {
++    getBridgeContext().store.updateSessionProviderId(binding.codepilotSessionId, '');
++    return { response: 'Session provider cleared. This chat now uses the default provider.' };
++  }
++
++  const provider = findConfiguredProvider(requested);
++  if (!provider) {
++    return buildUseProviderPanel(binding, 'Provider not found: ' + requested);
++  }
++
++  getBridgeContext().store.updateSessionProviderId(binding.codepilotSessionId, provider.id);
++  const providerName = typeof provider.name === 'string' ? provider.name : provider.id;
++  return {
++    response: `Session provider set to <code>${escapeHtml(providerName)}</code> <i>(${escapeHtml(provider.id)})</i>.`,
++  };
++}
++
++function buildCurrentProviderResponse(binding: ChannelBinding): string {
++  const current = getCurrentProviderState(binding);
++  return `Current provider: <code>${escapeHtml(current.name)}</code> <i>(${escapeHtml(current.id)})</i>${current.inherited ? ' [default]' : ''}.`;
++}
++
++function parseProviderCallback(callbackData: string): { action: 'use'; providerId: string } | { action: 'clear' } | null {
++  if (!callbackData.startsWith('provider:')) return null;
++  if (callbackData === 'provider:clear') return { action: 'clear' };
++  const parts = callbackData.split(':');
++  if (parts.length < 3 || parts[1] !== 'use') return null;
++  return { action: 'use', providerId: decodeURIComponent(parts.slice(2).join(':')) };
++}
++
++async function handleProviderCallback(
++  adapter: BaseChannelAdapter,
++  msg: InboundMessage,
++): Promise<boolean> {
++  const parsed = parseProviderCallback(msg.callbackData || '');
++  if (!parsed) return false;
++
++  const binding = router.resolve(msg.address);
++  const result = parsed.action === 'clear'
++    ? buildUseProviderCommandResult(binding, 'clear')
++    : buildUseProviderCommandResult(binding, parsed.providerId);
++
++  await deliver(adapter, {
++    address: msg.address,
++    text: result.response,
++    parseMode: 'HTML',
++    inlineButtons: result.responseButtons,
++    replyToMessageId: msg.callbackMessageId || msg.messageId,
++  });
++  return true;
++}
++
++function parseSkillCallback(callbackData: string): { action: 'use'; skillName: string } | { action: 'clear' } | null {
++  if (!callbackData.startsWith('skill:')) return null;
++  if (callbackData === 'skill:clear') return { action: 'clear' };
++  const parts = callbackData.split(':');
++  if (parts.length < 3 || parts[1] !== 'use') return null;
++  return { action: 'use', skillName: decodeURIComponent(parts.slice(2).join(':')) };
++}
++
++async function handleSkillCallback(
++  adapter: BaseChannelAdapter,
++  msg: InboundMessage,
++): Promise<boolean> {
++  const parsed = parseSkillCallback(msg.callbackData || '');
++  if (!parsed) return false;
++
++  const binding = router.resolve(msg.address);
++  if (parsed.action === 'clear') {
++    router.updateBinding(binding.id, { preferredSkill: undefined });
++    await deliver(adapter, {
++      address: msg.address,
++      text: 'Preferred skill cleared.',
++      parseMode: 'HTML',
++      replyToMessageId: msg.callbackMessageId || msg.messageId,
++    });
++    return true;
++  }
++
++  const result = buildUseSkillCommandResult(binding, parsed.skillName);
++  await deliver(adapter, {
++    address: msg.address,
++    text: result.response,
++    parseMode: 'HTML',
++    inlineButtons: result.responseButtons,
++    replyToMessageId: msg.callbackMessageId || msg.messageId,
++  });
++  return true;
++}
++
++function parseConfigCallback(callbackData: string): { setting: ConfigurableSetting; value: string } | null {
++  const parts = callbackData.split(':');
++  if (parts.length < 3 || parts[0] !== 'cfg') return null;
++  const setting = parts[1];
++  if (setting !== 'sandbox' && setting !== 'approval' && setting !== 'search') return null;
++  return { setting, value: parts.slice(2).join(':') };
++}
++
++function buildSettingUpdate(
++  setting: ConfigurableSetting,
++  value?: string,
++): Partial<Pick<ChannelBinding, 'sandboxMode' | 'approvalPolicy' | 'webSearchMode'>> {
++  switch (setting) {
++    case 'sandbox':
++      return { sandboxMode: value as ChannelBinding['sandboxMode'] };
++    case 'approval':
++      return { approvalPolicy: value as ChannelBinding['approvalPolicy'] };
++    case 'search':
++      return { webSearchMode: value as ChannelBinding['webSearchMode'] };
++  }
++}
++
++function parseSettingCommandValue(setting: ConfigurableSetting, rawArgs: string) {
++  switch (setting) {
++    case 'sandbox':
++      return parseSandboxOverride(rawArgs);
++    case 'approval':
++      return parseApprovalPolicyOverride(rawArgs);
++    case 'search':
++      return parseWebSearchModeOverride(rawArgs);
++  }
++}
++
++function buildSettingCommandResult(
++  binding: ChannelBinding,
++  setting: ConfigurableSetting,
++  rawArgs: string,
++): SettingCommandResult {
++  if (!rawArgs.trim()) {
++    return buildSettingPanel(binding, setting);
++  }
++
++  const parsed = parseSettingCommandValue(setting, rawArgs);
++  if (parsed.error) {
++    return buildSettingPanel(binding, setting, parsed.error);
++  }
++
++  router.updateBinding(binding.id, buildSettingUpdate(setting, parsed.clear ? undefined : parsed.value));
++  const valueLabel = parsed.clear ? 'default' : parsed.value || 'default';
++  return {
++    response: getSettingLabel(setting) + ' set to <code>' + escapeHtml(valueLabel) + '</code>.',
++  };
++}
++
++async function handleConfigCallback(
++  adapter: BaseChannelAdapter,
++  msg: InboundMessage,
++): Promise<boolean> {
++  const parsed = parseConfigCallback(msg.callbackData || '');
++  if (!parsed) return false;
++
++  const binding = router.resolve(msg.address);
++  const result = buildSettingCommandResult(binding, parsed.setting, parsed.value);
++  await deliver(adapter, {
++    address: msg.address,
++    text: result.response,
++    parseMode: 'HTML',
++    inlineButtons: result.responseButtons,
++    replyToMessageId: msg.callbackMessageId || msg.messageId,
++  });
++  return true;
++}
++
+ /**
+  * Check if a message looks like a numeric permission shortcut (1/2/3) for
+  * feishu/qq channels WITH at least one pending permission in that chat.
+@@ -455,8 +1066,26 @@ async function handleMessage(
+     }
+   };
+ 
+-  // Handle callback queries (permission buttons)
++  // Handle callback queries (buttons)
+   if (msg.callbackData) {
++    const providerHandled = await handleProviderCallback(adapter, msg);
++    if (providerHandled) {
++      ack();
++      return;
++    }
++
++    const skillHandled = await handleSkillCallback(adapter, msg);
++    if (skillHandled) {
++      ack();
++      return;
++    }
++
++    const configHandled = await handleConfigCallback(adapter, msg);
++    if (configHandled) {
++      ack();
++      return;
++    }
++
+     const handled = broker.handlePermissionCallback(msg.callbackData, msg.address.chatId, msg.callbackMessageId);
+     if (handled) {
+       // Send confirmation
+@@ -595,14 +1224,18 @@ async function handleMessage(
+   }
+ 
+   const streamCfg = previewState ? getStreamConfig(adapter.channelType) : null;
+-
+-  // Build the onPartialText callback (or undefined if preview not supported)
+-  const onPartialText = (previewState && streamCfg) ? (fullText: string) => {
+-    const ps = previewState!;
+-    const cfg = streamCfg!;
++  const PROGRESS_HEARTBEAT_MS = 15000;
++  let sawAssistantText = false;
++  let sawProgressEvent = false;
++  let lastProgressText = '';
++  let lastProgressAt = Date.now();
++
++  const pushPreviewText = (fullText: string): void => {
++    if (!previewState || !streamCfg) return;
++    const ps = previewState;
++    const cfg = streamCfg;
+     if (ps.degraded) return;
+ 
+-    // Truncate to maxChars + ellipsis
+     ps.pendingText = fullText.length > cfg.maxChars
+       ? fullText.slice(0, cfg.maxChars) + '...'
+       : fullText;
+@@ -611,7 +1244,6 @@ async function handleMessage(
+     const elapsed = Date.now() - ps.lastSentAt;
+ 
+     if (delta < cfg.minDeltaChars && ps.lastSentAt > 0) {
+-      // Not enough new content — schedule trailing-edge timer if not already set
+       if (!ps.throttleTimer) {
+         ps.throttleTimer = setTimeout(() => {
+           ps.throttleTimer = null;
+@@ -622,7 +1254,6 @@ async function handleMessage(
+     }
+ 
+     if (elapsed < cfg.intervalMs && ps.lastSentAt > 0) {
+-      // Too soon — schedule trailing-edge timer to ensure latest text is sent
+       if (!ps.throttleTimer) {
+         ps.throttleTimer = setTimeout(() => {
+           ps.throttleTimer = null;
+@@ -632,14 +1263,37 @@ async function handleMessage(
+       return;
+     }
+ 
+-    // Clear any pending trailing-edge timer and flush immediately
+     if (ps.throttleTimer) {
+       clearTimeout(ps.throttleTimer);
+       ps.throttleTimer = null;
+     }
+     flushPreview(adapter, ps, cfg);
++  };
++
++  // Build the onPartialText callback (or undefined if preview not supported)
++  const onPartialText = (previewState && streamCfg) ? (fullText: string) => {
++    sawAssistantText = true;
++    pushPreviewText(fullText);
+   } : undefined;
+ 
++  const onProgressUpdate = (progressText: string): void => {
++    sawProgressEvent = true;
++    lastProgressText = progressText;
++    lastProgressAt = Date.now();
++    if (!sawAssistantText) {
++      pushPreviewText(`⏳ ${progressText}`);
++    }
++  };
++
++  const progressHeartbeat = setInterval(() => {
++    if (!previewState || taskAbort.signal.aborted || sawAssistantText) return;
++    const idleMs = Date.now() - lastProgressAt;
++    if (idleMs < PROGRESS_HEARTBEAT_MS) return;
++    const seconds = Math.max(1, Math.round(idleMs / 1000));
++    pushPreviewText(`⏳ Still working… ${seconds}s`);
++    lastProgressAt = Date.now();
++  }, 5000);
++
+   try {
+     // Pass permission callback so requests are forwarded to IM immediately
+     // during streaming (the stream blocks until permission is resolved).
+@@ -657,7 +1311,7 @@ async function handleMessage(
+         perm.suggestions,
+         msg.messageId,
+       );
+-    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText);
++    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, onProgressUpdate);
+ 
+     // Send response text — render via channel-appropriate format
+     if (result.responseText) {
+@@ -670,6 +1324,13 @@ async function handleMessage(
+         replyToMessageId: msg.messageId,
+       };
+       await deliver(adapter, errorResponse);
++    } else if (sawProgressEvent) {
++      await deliver(adapter, {
++        address: msg.address,
++        text: `<b>Done.</b> Task finished${lastProgressText && lastProgressText !== 'Thinking…' ? ` — ${escapeHtml(lastProgressText)}` : ''}`,
++        parseMode: 'HTML',
++        replyToMessageId: msg.messageId,
++      });
+     }
+ 
+     // Persist the actual SDK session ID for future resume.
+@@ -684,6 +1345,7 @@ async function handleMessage(
+       } catch { /* best effort */ }
+     }
+   } finally {
++    clearInterval(progressHeartbeat);
+     // Clean up preview state
+     if (previewState) {
+       if (previewState.throttleTimer) {
+@@ -712,9 +1374,11 @@ async function handleCommand(
+   const { store } = getBridgeContext();
+ 
+   // Extract command and args (handle /command@botname format)
+-  const parts = text.split(/\s+/);
+-  const command = parts[0].split('@')[0].toLowerCase();
+-  const args = parts.slice(1).join(' ').trim();
++  const trimmedText = text.trim();
++  const firstWhitespace = trimmedText.search(/\s/);
++  const commandToken = firstWhitespace === -1 ? trimmedText : trimmedText.slice(0, firstWhitespace);
++  const command = commandToken.split('@')[0].toLowerCase();
++  const args = firstWhitespace === -1 ? '' : trimmedText.slice(firstWhitespace).trim();
+ 
+   // Run dangerous-input detection on the full command text
+   const dangerCheck = isDangerousInput(text);
+@@ -737,6 +1401,7 @@ async function handleCommand(
+   }
+ 
+   let response = '';
++  let responseButtons: InlineButton[][] | undefined;
+ 
+   switch (command) {
+     case '/start':
+@@ -746,10 +1411,21 @@ async function handleCommand(
+         'Send any message to interact with Claude.',
+         '',
+         '<b>Commands:</b>',
+-        '/new [path] - Start new session',
++        '/new [path] [-p provider] [-s sandbox] [-a approval] [--search [mode]] - Start new session',
+         '/bind &lt;session_id&gt; - Bind to existing session',
+         '/cwd /path - Change working directory',
+         '/mode plan|code|ask - Change mode',
++        '/sandbox [value] - Set or choose sandbox',
++        '/approval [value] - Set or choose approval policy',
++        '/search [value] - Set or choose web search',
++        '/skills - List available skills',
++        '/providers - List available providers',
++        '/use-provider [name] - Set or choose session provider',
++        '/current-provider - Show the session provider',
++        '/clear-provider - Use the default provider',
++        '/use-skill [name] - Set or choose preferred skill',
++        '/current-skill - Show the preferred skill',
++        '/clear-skill - Clear the preferred skill',
+         '/status - Show current status',
+         '/sessions - List recent sessions',
+         '/stop - Stop current session',
+@@ -759,17 +1435,34 @@ async function handleCommand(
+       break;
+ 
+     case '/new': {
+-      let workDir: string | undefined;
+-      if (args) {
+-        const validated = validateWorkingDirectory(args);
+-        if (!validated) {
+-          response = 'Invalid path. Must be an absolute path without traversal sequences.';
+-          break;
+-        }
+-        workDir = validated;
++      const parsed = parseNewSessionCommandArgs(args);
++      if (parsed.error) {
++        response = `${escapeHtml(parsed.error)}\n${escapeHtml(NEW_SESSION_COMMAND_USAGE)}`;
++        break;
+       }
+-      const binding = router.createBinding(msg.address, workDir);
+-      response = `New session created.\nSession: <code>${binding.codepilotSessionId.slice(0, 8)}...</code>\nCWD: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`;
++      if (parsed.options?.providerId && !findConfiguredProvider(parsed.options.providerId)) {
++        response = `Unknown provider: <code>${escapeHtml(parsed.options.providerId)}</code>\n${buildProvidersResponse()}`;
++        break;
++      }
++      const resolvedProvider = parsed.options?.providerId ? findConfiguredProvider(parsed.options.providerId) : undefined;
++      if (resolvedProvider && parsed.options) {
++        parsed.options.providerId = resolvedProvider.id;
++      }
++      const binding = router.createBinding(msg.address, parsed.options);
++      const session = store.getSession(binding.codepilotSessionId);
++      const providerId = session?.provider_id || store.getDefaultProviderId() || 'none';
++      const providerName = session?.provider_id ? (findConfiguredProvider(session.provider_id)?.name || session.provider_id) : providerId;
++      const approval = binding.approvalPolicy || (binding.mode === 'code' ? 'on-failure' : 'on-request');
++      response = [
++        'New session created.',
++        `Session: <code>${binding.codepilotSessionId.slice(0, 8)}...</code>`,
++        `CWD: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`,
++        `Provider: <code>${escapeHtml(providerName)}</code> <i>(${escapeHtml(providerId)})</i>`,
++        `Sandbox: <code>${escapeHtml(binding.sandboxMode || 'default')}</code>`,
++        `Approval: <code>${escapeHtml(approval)}</code>`,
++        `Search: <code>${escapeHtml(binding.webSearchMode || 'default')}</code>`,
++        `Skill: <code>${escapeHtml(binding.preferredSkill || 'none')}</code>`,
++      ].join('\n');
+       break;
+     }
+ 
+@@ -818,6 +1511,82 @@ async function handleCommand(
+       break;
+     }
+ 
++    case '/sandbox': {
++      const binding = router.resolve(msg.address);
++      const result = buildSettingCommandResult(binding, 'sandbox', args);
++      response = result.response;
++      responseButtons = result.responseButtons;
++      break;
++    }
++
++    case '/approval': {
++      const binding = router.resolve(msg.address);
++      const result = buildSettingCommandResult(binding, 'approval', args);
++      response = result.response;
++      responseButtons = result.responseButtons;
++      break;
++    }
++
++    case '/search': {
++      const binding = router.resolve(msg.address);
++      const result = buildSettingCommandResult(binding, 'search', args);
++      response = result.response;
++      responseButtons = result.responseButtons;
++      break;
++    }
++
++    case '/skills': {
++      response = buildSkillsResponse();
++      break;
++    }
++
++    case '/providers': {
++      response = buildProvidersResponse();
++      break;
++    }
++
++    case '/use-provider': {
++      const binding = router.resolve(msg.address);
++      const result = buildUseProviderCommandResult(binding, args);
++      response = result.response;
++      responseButtons = result.responseButtons;
++      break;
++    }
++
++    case '/current-provider': {
++      const binding = router.resolve(msg.address);
++      response = buildCurrentProviderResponse(binding);
++      break;
++    }
++
++    case '/clear-provider': {
++      const binding = router.resolve(msg.address);
++      getBridgeContext().store.updateSessionProviderId(binding.codepilotSessionId, '');
++      response = 'Session provider cleared. This chat now uses the default provider.';
++      break;
++    }
++
++    case '/use-skill': {
++      const binding = router.resolve(msg.address);
++      const result = buildUseSkillCommandResult(binding, args);
++      response = result.response;
++      responseButtons = result.responseButtons;
++      break;
++    }
++
++    case '/current-skill': {
++      const binding = router.resolve(msg.address);
++      response = buildCurrentSkillResponse(binding);
++      break;
++    }
++
++    case '/clear-skill': {
++      const binding = router.resolve(msg.address);
++      router.updateBinding(binding.id, { preferredSkill: undefined });
++      response = 'Preferred skill cleared.';
++      break;
++    }
++
+     case '/status': {
+       const binding = router.resolve(msg.address);
+       response = [
+@@ -827,6 +1596,11 @@ async function handleCommand(
+         `CWD: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`,
+         `Mode: <b>${binding.mode}</b>`,
+         `Model: <code>${binding.model || 'default'}</code>`,
++        `Provider: <code>${escapeHtml(findConfiguredProvider(store.getSession(binding.codepilotSessionId)?.provider_id || '')?.name || store.getSession(binding.codepilotSessionId)?.provider_id || store.getDefaultProviderId() || 'none')}</code>`,
++        `Sandbox: <code>${escapeHtml(binding.sandboxMode || 'default')}</code>`,
++        `Approval: <code>${escapeHtml(binding.approvalPolicy || (binding.mode === 'code' ? 'on-failure' : 'on-request'))}</code>`,
++        `Search: <code>${escapeHtml(binding.webSearchMode || 'default')}</code>`,
++        `Skill: <code>${escapeHtml(binding.preferredSkill || 'none')}</code>`,
+       ].join('\n');
+       break;
+     }
+@@ -884,10 +1658,21 @@ async function handleCommand(
+       response = [
+         '<b>CodePilot Bridge Commands</b>',
+         '',
+-        '/new [path] - Start new session',
++        '/new [path] [-p provider] [-s sandbox] [-a approval] [--search [mode]] - Start new session',
+         '/bind &lt;session_id&gt; - Bind to existing session',
+         '/cwd /path - Change working directory',
+         '/mode plan|code|ask - Change mode',
++        '/sandbox [value] - Set or choose sandbox',
++        '/approval [value] - Set or choose approval policy',
++        '/search [value] - Set or choose web search',
++        '/skills - List available skills',
++        '/providers - List available providers',
++        '/use-provider [name] - Set or choose session provider',
++        '/current-provider - Show the session provider',
++        '/clear-provider - Use the default provider',
++        '/use-skill [name] - Set or choose preferred skill',
++        '/current-skill - Show the preferred skill',
++        '/clear-skill - Clear the preferred skill',
+         '/status - Show current status',
+         '/sessions - List recent sessions',
+         '/stop - Stop current session',
+@@ -906,6 +1691,7 @@ async function handleCommand(
+       address: msg.address,
+       text: response,
+       parseMode: 'HTML',
++      inlineButtons: responseButtons,
+       replyToMessageId: msg.messageId,
+     });
+   }
+diff --git a/node_modules/claude-to-im/src/lib/bridge/channel-router.ts b/node_modules/claude-to-im/src/lib/bridge/channel-router.ts
+index b75a988..68e9282 100644
+--- a/node_modules/claude-to-im/src/lib/bridge/channel-router.ts
++++ b/node_modules/claude-to-im/src/lib/bridge/channel-router.ts
+@@ -5,9 +5,24 @@
+  * the corresponding ChannelBinding (and underlying chat_session).
+  */
+ 
+-import type { ChannelAddress, ChannelBinding, ChannelType } from './types.js';
++import type {
++  BridgeApprovalPolicy,
++  BridgeSandboxMode,
++  BridgeWebSearchMode,
++  ChannelAddress,
++  ChannelBinding,
++  ChannelType,
++} from './types.js';
+ import { getBridgeContext } from './context.js';
+ 
++export interface CreateBindingOptions {
++  workingDirectory?: string;
++  providerId?: string;
++  sandboxMode?: BridgeSandboxMode;
++  approvalPolicy?: BridgeApprovalPolicy;
++  webSearchMode?: BridgeWebSearchMode;
++}
++
+ /**
+  * Resolve an inbound address to a ChannelBinding.
+  * If no binding exists, auto-creates a new session and binding.
+@@ -30,15 +45,18 @@ export function resolve(address: ChannelAddress): ChannelBinding {
+  */
+ export function createBinding(
+   address: ChannelAddress,
+-  workingDirectory?: string,
++  options: CreateBindingOptions = {},
+ ): ChannelBinding {
+   const { store } = getBridgeContext();
+-  const defaultCwd = workingDirectory
++  const defaultCwd = options.workingDirectory
+     || store.getSetting('bridge_default_work_dir')
+     || process.env.HOME
+     || '';
+   const defaultModel = store.getSetting('bridge_default_model') || '';
+-  const defaultProviderId = store.getSetting('bridge_default_provider_id') || '';
++  const defaultProviderId = options.providerId
++    || store.getSetting('bridge_default_provider_id')
++    || store.getDefaultProviderId()
++    || '';
+ 
+   const displayName = address.displayName || address.chatId;
+   const session = store.createSession(
+@@ -59,6 +77,9 @@ export function createBinding(
+     codepilotSessionId: session.id,
+     workingDirectory: defaultCwd,
+     model: defaultModel,
++    sandboxMode: options.sandboxMode,
++    approvalPolicy: options.approvalPolicy,
++    webSearchMode: options.webSearchMode,
+   });
+ }
+ 
+@@ -87,7 +108,7 @@ export function bindToSession(
+  */
+ export function updateBinding(
+   id: string,
+-  updates: Partial<Pick<ChannelBinding, 'sdkSessionId' | 'workingDirectory' | 'model' | 'mode' | 'active'>>,
++  updates: Partial<Pick<ChannelBinding, 'sdkSessionId' | 'workingDirectory' | 'model' | 'sandboxMode' | 'approvalPolicy' | 'webSearchMode' | 'preferredSkill' | 'mode' | 'active'>>,
+ ): void {
+   getBridgeContext().store.updateChannelBinding(id, updates);
+ }
+diff --git a/node_modules/claude-to-im/src/lib/bridge/conversation-engine.ts b/node_modules/claude-to-im/src/lib/bridge/conversation-engine.ts
+index 5651e75..046d10d 100644
+--- a/node_modules/claude-to-im/src/lib/bridge/conversation-engine.ts
++++ b/node_modules/claude-to-im/src/lib/bridge/conversation-engine.ts
+@@ -39,6 +39,14 @@ export type OnPermissionRequest = (perm: PermissionRequestInfo) => Promise<void>
+  */
+ export type OnPartialText = (fullText: string) => void;
+ 
++/**
++ * Callback invoked on safe progress updates suitable for IM display.
++ * This intentionally avoids exposing raw chain-of-thought; callers receive
++ * only short summaries like tool starts/completions, todo counts, or generic
++ * "thinking" heartbeats.
++ */
++export type OnProgressUpdate = (progressText: string) => void;
++
+ export interface ConversationResult {
+   responseText: string;
+   tokenUsage: TokenUsage | null;
+@@ -50,6 +58,18 @@ export interface ConversationResult {
+   sdkSessionId: string | null;
+ }
+ 
++export function applyPreferredSkillPrompt(text: string, preferredSkill?: string): string {
++  const skill = preferredSkill?.trim();
++  if (!skill) return text;
++  return [
++    'Bridge note: The user selected the "' + skill + '" skill as the default for this chat.',
++    'Use that skill for this request unless the user explicitly asks for a different skill.',
++    '',
++    'User request:',
++    text,
++  ].join('\n');
++}
++
+ /**
+  * Process an inbound message: send to Claude, consume the response stream,
+  * save to DB, and return the result.
+@@ -61,6 +81,7 @@ export async function processMessage(
+   abortSignal?: AbortSignal,
+   files?: FileAttachment[],
+   onPartialText?: OnPartialText,
++  onProgressUpdate?: OnProgressUpdate,
+ ): Promise<ConversationResult> {
+   const { store, llm } = getBridgeContext();
+   const sessionId = binding.codepilotSessionId;
+@@ -157,13 +178,18 @@ export async function processMessage(
+       }
+     }
+ 
++    const promptText = applyPreferredSkillPrompt(text, binding.preferredSkill);
++
+     const stream = llm.streamChat({
+-      prompt: text,
++      prompt: promptText,
+       sessionId,
+       sdkSessionId: binding.sdkSessionId || undefined,
+       model: effectiveModel,
+       systemPrompt: session?.system_prompt || undefined,
+       workingDirectory: binding.workingDirectory || session?.working_directory || undefined,
++      sandboxMode: binding.sandboxMode || undefined,
++      approvalPolicy: binding.approvalPolicy || undefined,
++      webSearchMode: binding.webSearchMode || undefined,
+       abortController,
+       permissionMode,
+       provider: resolvedProvider,
+@@ -177,7 +203,7 @@ export async function processMessage(
+     // Consume the stream server-side (replicate collectStreamResponse pattern).
+     // Permission requests are forwarded immediately via the callback during streaming
+     // because the stream blocks until permission is resolved — we can't wait until after.
+-    return await consumeStream(stream, sessionId, onPermissionRequest, onPartialText);
++    return await consumeStream(stream, sessionId, onPermissionRequest, onPartialText, onProgressUpdate);
+   } finally {
+     clearInterval(renewalInterval);
+     store.releaseSessionLock(sessionId, lockId);
+@@ -194,6 +220,7 @@ async function consumeStream(
+   sessionId: string,
+   onPermissionRequest?: OnPermissionRequest,
+   onPartialText?: OnPartialText,
++  onProgressUpdate?: OnProgressUpdate,
+ ): Promise<ConversationResult> {
+   const { store } = getBridgeContext();
+   const reader = stream.getReader();
+@@ -207,6 +234,62 @@ async function consumeStream(
+   const seenToolResultIds = new Set<string>();
+   const permissionRequests: PermissionRequestInfo[] = [];
+   let capturedSdkSessionId: string | null = null;
++  const toolProgressLabels = new Map<string, string>();
++
++  const emitProgress = (progressText: string): void => {
++    if (!onProgressUpdate) return;
++    try { onProgressUpdate(progressText); } catch { /* non-critical */ }
++  };
++
++  const ellipsize = (value: string, maxLength = 72): string => {
++    const collapsed = value.replace(/\s+/g, ' ').trim();
++    if (collapsed.length <= maxLength) return collapsed;
++    return collapsed.slice(0, maxLength - 1) + '…';
++  };
++
++  const summarizeToolUse = (toolData: { id?: string; name?: string; input?: Record<string, unknown> }): string => {
++    const name = toolData.name || 'tool';
++    switch (name) {
++      case 'Bash': {
++        const command = typeof toolData.input?.command === 'string' ? toolData.input.command : '';
++        return command ? `Running command: ${ellipsize(command)}` : 'Running command';
++      }
++      case 'Edit': {
++        const files = Array.isArray(toolData.input?.files) ? toolData.input.files as Array<Record<string, unknown>> : [];
++        const paths = files
++          .map(file => typeof file.path === 'string' ? file.path : '')
++          .filter(Boolean)
++          .slice(0, 2);
++        if (paths.length > 0) {
++          return `Editing files: ${ellipsize(paths.join(', '))}`;
++        }
++        return 'Editing files';
++      }
++      default: {
++        if (name.startsWith('mcp__')) {
++          return `Calling ${ellipsize(name.replace(/^mcp__/, ''))}`;
++        }
++        return `Using ${ellipsize(name)}`;
++      }
++    }
++  };
++
++  const summarizeToolResult = (toolResult: { tool_use_id?: string; is_error?: boolean }): string | null => {
++    const label = toolResult.tool_use_id ? toolProgressLabels.get(toolResult.tool_use_id) : undefined;
++    if (!label) return null;
++    return toolResult.is_error ? `${label} failed` : `${label} finished`;
++  };
++
++  const summarizeTodos = (todos: Array<{ text?: string; completed?: boolean }>): string | null => {
++    if (!Array.isArray(todos) || todos.length === 0) return null;
++    const completed = todos.filter(todo => todo.completed).length;
++    const active = todos.find(todo => !todo.completed)?.text;
++    const prefix = `Plan progress: ${completed}/${todos.length} done`;
++    if (active) {
++      return `${prefix} — next: ${ellipsize(active)}`;
++    }
++    return prefix;
++  };
+ 
+   try {
+     while (true) {
+@@ -247,6 +330,14 @@ async function consumeStream(
+                 input: toolData.input,
+               });
+             } catch { /* skip */ }
++            try {
++              const toolData = JSON.parse(event.data);
++              const progressLabel = summarizeToolUse(toolData);
++              if (toolData.id && progressLabel) {
++                toolProgressLabels.set(toolData.id, progressLabel);
++              }
++              if (progressLabel) emitProgress(progressLabel);
++            } catch { /* skip */ }
+             break;
+           }
+ 
+@@ -269,6 +360,11 @@ async function consumeStream(
+                 contentBlocks.push(newBlock);
+               }
+             } catch { /* skip */ }
++            try {
++              const resultData = JSON.parse(event.data);
++              const progressLabel = summarizeToolResult(resultData);
++              if (progressLabel) emitProgress(progressLabel);
++            } catch { /* skip */ }
+             break;
+           }
+ 
+@@ -303,6 +399,9 @@ async function consumeStream(
+               if (statusData.model) {
+                 store.updateSessionModel(sessionId, statusData.model);
+               }
++              if (statusData.reasoning) {
++                emitProgress('Thinking…');
++              }
+             } catch { /* skip */ }
+             break;
+           }
+@@ -313,6 +412,8 @@ async function consumeStream(
+               if (taskData.session_id && taskData.todos) {
+                 store.syncSdkTasks(taskData.session_id, taskData.todos);
+               }
++              const summary = summarizeTodos(taskData.todos as Array<{ text?: string; completed?: boolean }>);
++              if (summary) emitProgress(summary);
+             } catch { /* skip */ }
+             break;
+           }
+diff --git a/node_modules/claude-to-im/src/lib/bridge/host.ts b/node_modules/claude-to-im/src/lib/bridge/host.ts
+index 51074ea..d1e3c8f 100644
+--- a/node_modules/claude-to-im/src/lib/bridge/host.ts
++++ b/node_modules/claude-to-im/src/lib/bridge/host.ts
+@@ -6,7 +6,13 @@
+  * interfaces to use the bridge.
+  */
+ 
+-import type { ChannelBinding, ChannelType } from './types.js';
++import type {
++  BridgeApprovalPolicy,
++  BridgeSandboxMode,
++  BridgeWebSearchMode,
++  ChannelBinding,
++  ChannelType,
++} from './types.js';
+ 
+ // ── Bridge-local types (replacing @/types imports) ────────────
+ 
+@@ -60,6 +66,9 @@ export interface TokenUsage {
+ /** API provider configuration (opaque to the bridge). */
+ export interface BridgeApiProvider {
+   id: string;
++  name?: string;
++  baseUrl?: string;
++  source?: string;
+   [key: string]: unknown;
+ }
+ 
+@@ -132,6 +141,9 @@ export interface UpsertChannelBindingInput {
+   codepilotSessionId: string;
+   workingDirectory: string;
+   model: string;
++  sandboxMode?: BridgeSandboxMode;
++  approvalPolicy?: BridgeApprovalPolicy;
++  webSearchMode?: BridgeWebSearchMode;
+ }
+ 
+ /**
+@@ -176,6 +188,7 @@ export interface BridgeStore {
+ 
+   // ── Provider ──
+   getProvider(id: string): BridgeApiProvider | undefined;
++  listProviders(): BridgeApiProvider[];
+   getDefaultProviderId(): string | null;
+ 
+   // ── Audit & dedup ──
+@@ -207,6 +220,9 @@ export interface StreamChatParams {
+   model?: string;
+   systemPrompt?: string;
+   workingDirectory?: string;
++  sandboxMode?: BridgeSandboxMode;
++  approvalPolicy?: BridgeApprovalPolicy;
++  webSearchMode?: BridgeWebSearchMode;
+   abortController?: AbortController;
+   permissionMode?: string;
+   provider?: BridgeApiProvider;
+diff --git a/node_modules/claude-to-im/src/lib/bridge/security/validators.ts b/node_modules/claude-to-im/src/lib/bridge/security/validators.ts
+index e013a32..bdba323 100644
+--- a/node_modules/claude-to-im/src/lib/bridge/security/validators.ts
++++ b/node_modules/claude-to-im/src/lib/bridge/security/validators.ts
+@@ -6,6 +6,11 @@
+  */
+ 
+ import * as path from 'path';
++import type {
++  BridgeApprovalPolicy,
++  BridgeSandboxMode,
++  BridgeWebSearchMode,
++} from '../types.js';
+ 
+ // ── Constants ────────────────────────────────────────────────────
+ 
+@@ -13,6 +18,32 @@ const MAX_INPUT_LENGTH = 32_000; // Claude's effective context limit
+ const MAX_PATH_LENGTH = 1024;
+ const SESSION_ID_PATTERN = /^[0-9a-f-]{32,64}$/i;
+ const VALID_MODES = ['plan', 'code', 'ask'] as const;
++const VALID_SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'] as const;
++const VALID_APPROVAL_POLICIES = ['never', 'on-request', 'on-failure', 'untrusted'] as const;
++const VALID_WEB_SEARCH_MODES = ['disabled', 'cached', 'live'] as const;
++
++export const SANDBOX_MODE_OPTIONS = [...VALID_SANDBOX_MODES];
++export const APPROVAL_POLICY_OPTIONS = [...VALID_APPROVAL_POLICIES];
++export const WEB_SEARCH_MODE_OPTIONS = [...VALID_WEB_SEARCH_MODES];
++
++export const NEW_SESSION_COMMAND_USAGE = 'Usage: /new [path] [-p provider] [-s read-only|workspace-write|danger-full-access] [-a never|on-request|on-failure|untrusted] [--search [live|cached|disabled]|--no-search]';
++export const SANDBOX_COMMAND_USAGE = 'Usage: /sandbox default|read-only|workspace-write|danger-full-access';
++export const APPROVAL_COMMAND_USAGE = 'Usage: /approval default|never|on-request|on-failure|untrusted';
++export const SEARCH_COMMAND_USAGE = 'Usage: /search default|live|cached|disabled';
++
++export interface NewSessionCommandOptions {
++  workingDirectory?: string;
++  providerId?: string;
++  sandboxMode?: BridgeSandboxMode;
++  approvalPolicy?: BridgeApprovalPolicy;
++  webSearchMode?: BridgeWebSearchMode;
++}
++
++interface DefaultableSettingParse<T extends string> {
++  value?: T;
++  clear?: boolean;
++  error?: string;
++}
+ 
+ /**
+  * Patterns that indicate shell injection or dangerous input.
+@@ -125,3 +156,228 @@ export function sanitizeInput(
+ export function validateMode(mode: string): mode is 'plan' | 'code' | 'ask' {
+   return VALID_MODES.includes(mode as typeof VALID_MODES[number]);
+ }
++
++export function validateSandboxMode(mode: string): mode is BridgeSandboxMode {
++  return VALID_SANDBOX_MODES.includes(mode as typeof VALID_SANDBOX_MODES[number]);
++}
++
++export function validateApprovalPolicy(policy: string): policy is BridgeApprovalPolicy {
++  return VALID_APPROVAL_POLICIES.includes(policy as typeof VALID_APPROVAL_POLICIES[number]);
++}
++
++export function validateWebSearchMode(mode: string): mode is BridgeWebSearchMode {
++  return VALID_WEB_SEARCH_MODES.includes(mode as typeof VALID_WEB_SEARCH_MODES[number]);
++}
++
++function parseDefaultableChoice<T extends string>(
++  rawValue: string,
++  validate: (value: string) => value is T,
++): DefaultableSettingParse<T> {
++  const trimmed = rawValue.trim();
++  if (!trimmed) {
++    return { error: '__missing__' };
++  }
++  if (trimmed === 'default') {
++    return { clear: true };
++  }
++  if (validate(trimmed)) {
++    return { value: trimmed };
++  }
++  return { error: '__invalid__' };
++}
++
++export function parseSandboxOverride(rawValue: string): DefaultableSettingParse<BridgeSandboxMode> {
++  const parsed = parseDefaultableChoice(rawValue, validateSandboxMode);
++  if (parsed.error === '__missing__') {
++    return { error: 'Missing sandbox value.' };
++  }
++  if (parsed.error === '__invalid__') {
++    return { error: 'Invalid sandbox mode: ' + rawValue.trim() };
++  }
++  return parsed;
++}
++
++export function parseApprovalPolicyOverride(rawValue: string): DefaultableSettingParse<BridgeApprovalPolicy> {
++  const parsed = parseDefaultableChoice(rawValue, validateApprovalPolicy);
++  if (parsed.error === '__missing__') {
++    return { error: 'Missing approval value.' };
++  }
++  if (parsed.error === '__invalid__') {
++    return { error: 'Invalid approval policy: ' + rawValue.trim() };
++  }
++  return parsed;
++}
++
++export function parseWebSearchModeOverride(rawValue: string): DefaultableSettingParse<BridgeWebSearchMode> {
++  const parsed = parseDefaultableChoice(rawValue, validateWebSearchMode);
++  if (parsed.error === '__missing__') {
++    return { error: 'Missing search value.' };
++  }
++  if (parsed.error === '__invalid__') {
++    return { error: 'Invalid search mode: ' + rawValue.trim() };
++  }
++  return parsed;
++}
++
++function tokenizeCommandArgs(rawArgs: string): { tokens: string[]; error?: string } {
++  const tokens: string[] = [];
++  let current = '';
++  let quote: '"' | "'" | null = null;
++
++  for (const char of rawArgs.trim()) {
++    if (quote) {
++      if (char === quote) {
++        quote = null;
++      } else {
++        current += char;
++      }
++      continue;
++    }
++
++    if (char === '"' || char === "'") {
++      quote = char;
++      continue;
++    }
++
++    if (/\s/.test(char)) {
++      if (current) {
++        tokens.push(current);
++        current = '';
++      }
++      continue;
++    }
++
++    current += char;
++  }
++
++  if (quote) {
++    return { tokens, error: 'Invalid command: unmatched quote.' };
++  }
++
++  if (current) {
++    tokens.push(current);
++  }
++
++  return { tokens };
++}
++
++function readFlagValue(tokens: string[], index: number, inlineValue?: string): { value?: string; nextIndex: number } {
++  if (inlineValue !== undefined) {
++    return { value: inlineValue, nextIndex: index };
++  }
++  if (index + 1 >= tokens.length) {
++    return { nextIndex: index };
++  }
++  return { value: tokens[index + 1], nextIndex: index + 1 };
++}
++
++export function parseNewSessionCommandArgs(rawArgs: string): { options?: NewSessionCommandOptions; error?: string } {
++  if (!rawArgs.trim()) {
++    return { options: {} };
++  }
++
++  const { tokens, error } = tokenizeCommandArgs(rawArgs);
++  if (error) {
++    return { error };
++  }
++
++  const options: NewSessionCommandOptions = {};
++
++  for (let index = 0; index < tokens.length; index += 1) {
++    const token = tokens[index];
++
++    if (token === '--no-search') {
++      options.webSearchMode = 'disabled';
++      continue;
++    }
++
++    if (token === '--search' || token.startsWith('--search=')) {
++      const inlineValue = token.startsWith('--search=') ? token.slice('--search='.length) : undefined;
++      const nextToken = tokens[index + 1];
++      if (inlineValue !== undefined) {
++        if (!validateWebSearchMode(inlineValue)) {
++          return { error: `Invalid search mode: ${inlineValue}` };
++        }
++        options.webSearchMode = inlineValue;
++        continue;
++      }
++      if (!nextToken || nextToken.startsWith('-')) {
++        options.webSearchMode = 'live';
++        continue;
++      }
++      if (!validateWebSearchMode(nextToken)) {
++        return { error: `Invalid search mode: ${nextToken}` };
++      }
++      options.webSearchMode = nextToken;
++      index += 1;
++      continue;
++    }
++
++    if (token === '-s' || token === '--sandbox' || token.startsWith('-s=') || token.startsWith('--sandbox=')) {
++      const inlineValue = token.startsWith('-s=')
++        ? token.slice(3)
++        : token.startsWith('--sandbox=')
++          ? token.slice('--sandbox='.length)
++          : undefined;
++      const { value, nextIndex } = readFlagValue(tokens, index, inlineValue);
++      if (!value) {
++        return { error: 'Missing sandbox value.' };
++      }
++      if (!validateSandboxMode(value)) {
++        return { error: `Invalid sandbox mode: ${value}` };
++      }
++      options.sandboxMode = value;
++      index = nextIndex;
++      continue;
++    }
++
++    if (token === '-p' || token === '--provider' || token.startsWith('-p=') || token.startsWith('--provider=')) {
++      const inlineValue = token.startsWith('-p=')
++        ? token.slice(3)
++        : token.startsWith('--provider=')
++          ? token.slice('--provider='.length)
++          : undefined;
++      const { value, nextIndex } = readFlagValue(tokens, index, inlineValue);
++      if (!value) {
++        return { error: 'Missing provider value.' };
++      }
++      options.providerId = value.trim();
++      index = nextIndex;
++      continue;
++    }
++
++    if (token === '-a' || token === '--approval' || token.startsWith('-a=') || token.startsWith('--approval=')) {
++      const inlineValue = token.startsWith('-a=')
++        ? token.slice(3)
++        : token.startsWith('--approval=')
++          ? token.slice('--approval='.length)
++          : undefined;
++      const { value, nextIndex } = readFlagValue(tokens, index, inlineValue);
++      if (!value) {
++        return { error: 'Missing approval value.' };
++      }
++      if (!validateApprovalPolicy(value)) {
++        return { error: `Invalid approval policy: ${value}` };
++      }
++      options.approvalPolicy = value;
++      index = nextIndex;
++      continue;
++    }
++
++    if (token.startsWith('-')) {
++      return { error: `Unknown option: ${token}` };
++    }
++
++    if (options.workingDirectory) {
++      return { error: `Unexpected extra argument: ${token}` };
++    }
++
++    const validatedPath = validateWorkingDirectory(token);
++    if (!validatedPath) {
++      return { error: 'Invalid path. Must be an absolute path without traversal sequences or special characters.' };
++    }
++    options.workingDirectory = validatedPath;
++  }
++
++  return { options };
++}
+diff --git a/node_modules/claude-to-im/src/lib/bridge/types.ts b/node_modules/claude-to-im/src/lib/bridge/types.ts
+index 15f4ee9..3c6a989 100644
+--- a/node_modules/claude-to-im/src/lib/bridge/types.ts
++++ b/node_modules/claude-to-im/src/lib/bridge/types.ts
+@@ -18,6 +18,12 @@ export type { FileAttachment } from './host.js';
+  */
+ export type ChannelType = string;
+ 
++export type BridgeSandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
++
++export type BridgeApprovalPolicy = 'never' | 'on-request' | 'on-failure' | 'untrusted';
++
++export type BridgeWebSearchMode = 'disabled' | 'cached' | 'live';
++
+ /** Unique address of a user within a channel */
+ export interface ChannelAddress {
+   channelType: ChannelType;
+@@ -99,6 +105,14 @@ export interface ChannelBinding {
+   workingDirectory: string;
+   /** Model override for this binding */
+   model: string;
++  /** Sandbox override for Codex-backed sessions */
++  sandboxMode?: BridgeSandboxMode;
++  /** Approval-policy override for Codex-backed sessions */
++  approvalPolicy?: BridgeApprovalPolicy;
++  /** Web-search override for Codex-backed sessions */
++  webSearchMode?: BridgeWebSearchMode;
++  /** Preferred skill name for this chat */
++  preferredSkill?: string;
+   /** Chat mode */
+   mode: 'code' | 'plan' | 'ask';
+   /** Whether this binding is currently active */
