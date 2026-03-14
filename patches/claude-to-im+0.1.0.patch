@@ -1,5 +1,5 @@
 diff --git a/node_modules/claude-to-im/src/lib/bridge/bridge-manager.ts b/node_modules/claude-to-im/src/lib/bridge/bridge-manager.ts
-index 1f012c5..b11e5a9 100644
+index 1f012c5..338ef85 100644
 --- a/node_modules/claude-to-im/src/lib/bridge/bridge-manager.ts
 +++ b/node_modules/claude-to-im/src/lib/bridge/bridge-manager.ts
 @@ -7,7 +7,12 @@
@@ -701,7 +701,7 @@ index 1f012c5..b11e5a9 100644
      const handled = broker.handlePermissionCallback(msg.callbackData, msg.address.chatId, msg.callbackMessageId);
      if (handled) {
        // Send confirmation
-@@ -595,14 +1256,21 @@ async function handleMessage(
+@@ -595,14 +1256,22 @@ async function handleMessage(
    }
  
    const streamCfg = previewState ? getStreamConfig(adapter.channelType) : null;
@@ -718,6 +718,7 @@ index 1f012c5..b11e5a9 100644
 +  let lastProgressAt = Date.now();
 +  let lastAssistantPreviewText = '';
 +  let lastVisibleProgressText = '';
++  let progressActive = false;
 +
 +  const pushPreviewText = (fullText: string): void => {
 +    if (!previewState || !streamCfg) return;
@@ -729,7 +730,7 @@ index 1f012c5..b11e5a9 100644
      ps.pendingText = fullText.length > cfg.maxChars
        ? fullText.slice(0, cfg.maxChars) + '...'
        : fullText;
-@@ -611,7 +1279,6 @@ async function handleMessage(
+@@ -611,7 +1280,6 @@ async function handleMessage(
      const elapsed = Date.now() - ps.lastSentAt;
  
      if (delta < cfg.minDeltaChars && ps.lastSentAt > 0) {
@@ -737,7 +738,7 @@ index 1f012c5..b11e5a9 100644
        if (!ps.throttleTimer) {
          ps.throttleTimer = setTimeout(() => {
            ps.throttleTimer = null;
-@@ -622,7 +1289,6 @@ async function handleMessage(
+@@ -622,7 +1290,6 @@ async function handleMessage(
      }
  
      if (elapsed < cfg.intervalMs && ps.lastSentAt > 0) {
@@ -745,7 +746,7 @@ index 1f012c5..b11e5a9 100644
        if (!ps.throttleTimer) {
          ps.throttleTimer = setTimeout(() => {
            ps.throttleTimer = null;
-@@ -632,14 +1298,55 @@ async function handleMessage(
+@@ -632,14 +1299,66 @@ async function handleMessage(
        return;
      }
  
@@ -759,7 +760,12 @@ index 1f012c5..b11e5a9 100644
 +
 +  const renderProgressPreviewText = (): string => {
 +    const progressPrefix = lastVisibleProgressText ? `⏳ ${lastVisibleProgressText}` : '';
-+    if (progressMode === 'verbose' && progressPrefix) {
++    const shouldAppendProgress = !!progressPrefix && (
++      !lastAssistantPreviewText ||
++      progressMode === 'verbose' ||
++      progressActive
++    );
++    if (shouldAppendProgress) {
 +      if (lastAssistantPreviewText) {
 +        return `${lastAssistantPreviewText}\n\n${progressPrefix}`;
 +      }
@@ -772,27 +778,33 @@ index 1f012c5..b11e5a9 100644
 +  const onPartialText = (previewState && streamCfg) ? (fullText: string) => {
 +    sawAssistantText = true;
 +    lastAssistantPreviewText = fullText;
++    if (progressActive) {
++      progressActive = false;
++      if (progressMode !== 'verbose') {
++        lastVisibleProgressText = '';
++      }
++    }
 +    pushPreviewText(renderProgressPreviewText());
    } : undefined;
  
 +  const onProgressUpdate = (progressText: string): void => {
 +    if (progressMode === 'quiet') return;
 +    sawProgressEvent = true;
++    progressActive = true;
 +    lastProgressText = progressText;
 +    lastProgressAt = Date.now();
 +    lastVisibleProgressText = progressText;
-+    if (!sawAssistantText || progressMode === 'verbose') {
-+      pushPreviewText(renderProgressPreviewText());
-+    }
++    pushPreviewText(renderProgressPreviewText());
 +  };
 +
 +  const progressHeartbeat = setInterval(() => {
 +    if (!previewState || taskAbort.signal.aborted || progressMode === 'quiet') return;
-+    if (sawAssistantText && progressMode !== 'verbose') return;
++    if (sawAssistantText && !progressActive && progressMode !== 'verbose') return;
 +    const idleMs = Date.now() - lastProgressAt;
 +    if (idleMs < progressHeartbeatMs) return;
 +    const seconds = Math.max(1, Math.round(idleMs / 1000));
 +    sawProgressEvent = true;
++    progressActive = true;
 +    lastProgressText = `Still working… ${seconds}s`;
 +    lastVisibleProgressText = lastProgressText;
 +    pushPreviewText(renderProgressPreviewText());
@@ -802,7 +814,7 @@ index 1f012c5..b11e5a9 100644
    try {
      // Pass permission callback so requests are forwarded to IM immediately
      // during streaming (the stream blocks until permission is resolved).
-@@ -657,7 +1364,7 @@ async function handleMessage(
+@@ -657,7 +1376,7 @@ async function handleMessage(
          perm.suggestions,
          msg.messageId,
        );
@@ -811,7 +823,7 @@ index 1f012c5..b11e5a9 100644
  
      // Send response text — render via channel-appropriate format
      if (result.responseText) {
-@@ -670,6 +1377,16 @@ async function handleMessage(
+@@ -670,6 +1389,16 @@ async function handleMessage(
          replyToMessageId: msg.messageId,
        };
        await deliver(adapter, errorResponse);
@@ -828,7 +840,7 @@ index 1f012c5..b11e5a9 100644
      }
  
      // Persist the actual SDK session ID for future resume.
-@@ -684,6 +1401,7 @@ async function handleMessage(
+@@ -684,6 +1413,7 @@ async function handleMessage(
        } catch { /* best effort */ }
      }
    } finally {
@@ -836,7 +848,7 @@ index 1f012c5..b11e5a9 100644
      // Clean up preview state
      if (previewState) {
        if (previewState.throttleTimer) {
-@@ -712,9 +1430,11 @@ async function handleCommand(
+@@ -712,9 +1442,11 @@ async function handleCommand(
    const { store } = getBridgeContext();
  
    // Extract command and args (handle /command@botname format)
@@ -851,7 +863,7 @@ index 1f012c5..b11e5a9 100644
  
    // Run dangerous-input detection on the full command text
    const dangerCheck = isDangerousInput(text);
-@@ -737,6 +1457,7 @@ async function handleCommand(
+@@ -737,6 +1469,7 @@ async function handleCommand(
    }
  
    let response = '';
@@ -859,7 +871,7 @@ index 1f012c5..b11e5a9 100644
  
    switch (command) {
      case '/start':
-@@ -746,10 +1467,22 @@ async function handleCommand(
+@@ -746,10 +1479,22 @@ async function handleCommand(
          'Send any message to interact with Claude.',
          '',
          '<b>Commands:</b>',
@@ -883,7 +895,7 @@ index 1f012c5..b11e5a9 100644
          '/status - Show current status',
          '/sessions - List recent sessions',
          '/stop - Stop current session',
-@@ -759,17 +1492,35 @@ async function handleCommand(
+@@ -759,17 +1504,35 @@ async function handleCommand(
        break;
  
      case '/new': {
@@ -903,13 +915,13 @@ index 1f012c5..b11e5a9 100644
 +      if (parsed.options?.providerId && !findConfiguredProvider(parsed.options.providerId)) {
 +        response = `Unknown provider: <code>${escapeHtml(parsed.options.providerId)}</code>\n${buildProvidersResponse()}`;
 +        break;
-+      }
-+      const resolvedProvider = parsed.options?.providerId ? findConfiguredProvider(parsed.options.providerId) : undefined;
-+      if (resolvedProvider && parsed.options) {
-+        parsed.options.providerId = resolvedProvider.id;
        }
 -      const binding = router.createBinding(msg.address, workDir);
 -      response = `New session created.\nSession: <code>${binding.codepilotSessionId.slice(0, 8)}...</code>\nCWD: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`;
++      const resolvedProvider = parsed.options?.providerId ? findConfiguredProvider(parsed.options.providerId) : undefined;
++      if (resolvedProvider && parsed.options) {
++        parsed.options.providerId = resolvedProvider.id;
++      }
 +      const binding = router.createBinding(msg.address, parsed.options);
 +      const session = store.getSession(binding.codepilotSessionId);
 +      const providerId = session?.provider_id || store.getDefaultProviderId() || 'none';
@@ -929,7 +941,7 @@ index 1f012c5..b11e5a9 100644
        break;
      }
  
-@@ -818,6 +1569,90 @@ async function handleCommand(
+@@ -818,6 +1581,90 @@ async function handleCommand(
        break;
      }
  
@@ -1020,7 +1032,7 @@ index 1f012c5..b11e5a9 100644
      case '/status': {
        const binding = router.resolve(msg.address);
        response = [
-@@ -827,6 +1662,12 @@ async function handleCommand(
+@@ -827,6 +1674,12 @@ async function handleCommand(
          `CWD: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`,
          `Mode: <b>${binding.mode}</b>`,
          `Model: <code>${binding.model || 'default'}</code>`,
@@ -1033,7 +1045,7 @@ index 1f012c5..b11e5a9 100644
        ].join('\n');
        break;
      }
-@@ -884,10 +1725,22 @@ async function handleCommand(
+@@ -884,10 +1737,22 @@ async function handleCommand(
        response = [
          '<b>CodePilot Bridge Commands</b>',
          '',
@@ -1057,7 +1069,7 @@ index 1f012c5..b11e5a9 100644
          '/status - Show current status',
          '/sessions - List recent sessions',
          '/stop - Stop current session',
-@@ -906,6 +1759,7 @@ async function handleCommand(
+@@ -906,6 +1771,7 @@ async function handleCommand(
        address: msg.address,
        text: response,
        parseMode: 'HTML',
