@@ -390,6 +390,8 @@ describe('CodexProvider', () => {
 
     let capturedCtorOptions: Record<string, unknown> | undefined;
     let capturedStartOptions: Record<string, unknown> | undefined;
+    const logs: string[] = [];
+    const originalLog = console.log;
     const mockThread = {
       runStreamed: () => ({
         events: (async function* () {
@@ -409,20 +411,30 @@ describe('CodexProvider', () => {
     }
 
     (provider as any).sdk = { Codex: MockCodex };
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map(arg => String(arg)).join(' '));
+    };
 
-    const stream = provider.streamChat({
-      prompt: 'hello',
-      sessionId: 'provider-session',
-      provider: { id: 'yunyi', baseUrl: 'https://yunyi.cfd/codex' },
-    });
-    await collectStream(stream);
+    try {
+      const stream = provider.streamChat({
+        prompt: 'hello',
+        sessionId: 'provider-session',
+        provider: { id: 'yunyi', modelProvider: 'yunyi', baseUrl: 'https://yunyi.cfd/codex' },
+      });
+      await collectStream(stream);
+    } finally {
+      console.log = originalLog;
+    }
 
     assert.deepEqual(capturedCtorOptions?.config, { model_provider: 'yunyi' });
     assert.equal(capturedCtorOptions?.baseUrl, 'https://yunyi.cfd/codex');
     assert.ok(!Object.prototype.hasOwnProperty.call(capturedCtorOptions ?? {}, 'apiKey'));
     assert.ok(capturedStartOptions);
+    assert.ok(logs.some(line => line.includes('[codex-provider] Using provider')
+      && line.includes('"providerId":"yunyi"')
+      && line.includes('"modelProvider":"yunyi"')
+      && line.includes('"baseUrl":"https://yunyi.cfd/codex"')));
   });
-
   it('passes sandbox, approval, and search overrides to Codex', async () => {
     const { CodexProvider } = await import('../codex-provider.js');
     const { PendingPermissions } = await import('../permission-gateway.js');

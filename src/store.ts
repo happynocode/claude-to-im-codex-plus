@@ -159,10 +159,23 @@ function extractTomlString(configText: string, key: string): string | undefined 
 
 function extractProviderBaseUrl(configText: string, providerName?: string): string | undefined {
   if (!providerName) return undefined;
-  const sectionPattern = new RegExp(`^\\[model_providers\\.${escapeRegex(providerName)}\\]\\n([\\s\\S]*?)(?=^\\[|$)`, 'm');
-  const sectionMatch = configText.match(sectionPattern);
-  if (!sectionMatch) return undefined;
-  const baseUrlMatch = sectionMatch[1].match(/^base_url\s*=\s*"([^"]*)"/m);
+  const headerPattern = new RegExp(`^\\[model_providers\\.${escapeRegex(providerName)}\\]$`, 'm');
+  const headerMatch = headerPattern.exec(configText);
+  if (!headerMatch) return undefined;
+
+  let sectionBody = configText.slice(headerMatch.index + headerMatch[0].length);
+  if (sectionBody.startsWith('\r\n')) {
+    sectionBody = sectionBody.slice(2);
+  } else if (sectionBody.startsWith('\n')) {
+    sectionBody = sectionBody.slice(1);
+  }
+
+  const nextSectionMatch = /^\[/m.exec(sectionBody);
+  if (nextSectionMatch && nextSectionMatch.index !== undefined) {
+    sectionBody = sectionBody.slice(0, nextSectionMatch.index);
+  }
+
+  const baseUrlMatch = sectionBody.match(/^base_url\s*=\s*"([^"]*)"/m);
   return baseUrlMatch ? baseUrlMatch[1] : undefined;
 }
 

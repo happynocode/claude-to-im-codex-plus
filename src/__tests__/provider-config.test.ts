@@ -40,11 +40,11 @@ describe('Codex provider config loading', () => {
     fs.writeFileSync(path.join(ccSwitchDir, 'schema.sql'), '');
     const configPayload = JSON.stringify({
       auth: { OPENAI_API_KEY: 'token-alt', auth_mode: 'apikey' },
-      config: 'model_provider = "yunyi"\n\n[model_providers.yunyi]\nbase_url = "https://example.com/codex"\n',
+      config: 'model_provider = "yunyi"\n\n[model_providers.yunyi]\nname = "yunyi"\nbase_url = "https://example.com/codex"\n',
     });
     const configPayload2 = JSON.stringify({
       auth: { OPENAI_API_KEY: 'token-yunyi', auth_mode: 'apikey' },
-      config: 'model_provider = "yunyi"\n\n[model_providers.yunyi]\nbase_url = "https://yunyi.cfd/codex"\n',
+      config: 'model_provider = "yunyi"\n\n[model_providers.yunyi]\nname = "yunyi"\nbase_url = "https://yunyi.cfd/codex"\n',
     });
     const sql = [
       'create table providers (id text not null, app_type text not null, name text not null, settings_config text not null, website_url text, category text, created_at integer, sort_index integer, notes text, icon text, icon_color text, meta text not null default "{}", is_current boolean not null default 0, in_failover_queue boolean not null default 0, cost_multiplier text not null default "1.0", limit_daily_usd text, limit_monthly_usd text, provider_type text, primary key (id, app_type));',

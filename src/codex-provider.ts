@@ -68,6 +68,18 @@ function shouldRetryFreshThread(message: string): boolean {
   );
 }
 
+function resolveProviderDebugInfo(provider?: BridgeApiProvider): { providerId: string; modelProvider: string; baseUrl: string } {
+  const providerId = provider?.id && provider.id !== 'env' ? provider.id : 'env';
+  const modelProvider = typeof provider?.modelProvider === 'string' && provider.modelProvider.trim()
+    ? provider.modelProvider
+    : providerId;
+  const envBaseUrl = process.env.CTI_CODEX_BASE_URL || process.env.OPENAI_BASE_URL;
+  const baseUrl = providerId === 'env'
+    ? (envBaseUrl || '(default)')
+    : (typeof provider?.baseUrl === 'string' && provider.baseUrl.trim() ? provider.baseUrl : '(default)');
+
+  return { providerId, modelProvider, baseUrl };
+}
 export class CodexProvider implements LLMProvider {
   private sdk: CodexModule | null = null;
   private codex: CodexInstance | null = null;
@@ -137,6 +149,7 @@ export class CodexProvider implements LLMProvider {
         (async () => {
           const tempFiles: string[] = [];
           try {
+            console.log('[codex-provider] Using provider', JSON.stringify(resolveProviderDebugInfo(params.provider)));
             const { codex } = await self.ensureSDK(params.provider);
 
             // Resolve or create thread
