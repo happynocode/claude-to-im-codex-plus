@@ -75,6 +75,8 @@ interface ParsedCodexProvider extends BridgeApiProvider {
   source: 'cc_switch' | 'codex_config';
   apiKey?: string;
   modelProvider?: string;
+  configText?: string;
+  authData?: Record<string, unknown>;
 }
 
 function escapeRegex(value: string): string {
@@ -223,6 +225,9 @@ function loadCodexProvidersFromCcSwitch(): { defaultProviderId: string | null; p
     const apiKey = typeof settingsConfig?.auth?.OPENAI_API_KEY === 'string'
       ? settingsConfig.auth.OPENAI_API_KEY
       : undefined;
+    const authData = settingsConfig?.auth && typeof settingsConfig.auth === 'object' && !Array.isArray(settingsConfig.auth)
+      ? settingsConfig.auth
+      : undefined;
 
     providers.set(row.id, {
       id: row.id,
@@ -231,6 +236,8 @@ function loadCodexProvidersFromCcSwitch(): { defaultProviderId: string | null; p
       ...(apiKey ? { apiKey } : {}),
       ...(modelProvider ? { modelProvider } : {}),
       ...(baseUrl ? { baseUrl } : {}),
+      ...(configText ? { configText } : {}),
+      ...(authData ? { authData } : {}),
     });
 
     if (row.is_current === 1) {

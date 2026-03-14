@@ -419,7 +419,22 @@ describe('CodexProvider', () => {
       const stream = provider.streamChat({
         prompt: 'hello',
         sessionId: 'provider-session',
-        provider: { id: 'yunyi', modelProvider: 'yunyi', baseUrl: 'https://yunyi.cfd/codex' },
+        provider: {
+          id: 'yunyi',
+          name: 'W',
+          modelProvider: 'yunyi',
+          baseUrl: 'https://yunyi.cfd/codex',
+          apiKey: 'token-yunyi',
+          authData: { OPENAI_API_KEY: 'token-yunyi', auth_mode: 'apikey' },
+          configText: `model_provider = "yunyi"
+
+[model_providers.yunyi]
+name = "yunyi"
+base_url = "https://yunyi.cfd/codex"
+experimental_bearer_token = "token-yunyi"
+requires_openai_auth = true
+`,
+        },
       });
       await collectStream(stream);
     } finally {
@@ -428,7 +443,11 @@ describe('CodexProvider', () => {
 
     assert.deepEqual(capturedCtorOptions?.config, { model_provider: 'yunyi' });
     assert.equal(capturedCtorOptions?.baseUrl, 'https://yunyi.cfd/codex');
-    assert.ok(!Object.prototype.hasOwnProperty.call(capturedCtorOptions ?? {}, 'apiKey'));
+    assert.equal(capturedCtorOptions?.apiKey, 'token-yunyi');
+    assert.equal(typeof capturedCtorOptions?.env?.HOME, 'string');
+    const isolatedHome = String(capturedCtorOptions?.env?.HOME || '');
+    assert.match(fs.readFileSync(isolatedHome + '/.codex/auth.json', 'utf8'), /token-yunyi/);
+    assert.match(fs.readFileSync(isolatedHome + '/.codex/config.toml', 'utf8'), /experimental_bearer_token = "token-yunyi"/);
     assert.ok(capturedStartOptions);
     assert.ok(logs.some(line => line.includes('[codex-provider] Using provider')
       && line.includes('"providerId":"yunyi"')

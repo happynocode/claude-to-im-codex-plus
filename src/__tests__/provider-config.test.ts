@@ -58,5 +58,7 @@ describe('Codex provider config loading', () => {
     assert.deepEqual(store.listProviders().map(provider => provider.id), ['alt', 'yunyi-a']);
     assert.equal(store.getProvider('alt')?.baseUrl, 'https://yunyi.cfd/codex');
     assert.equal(store.getProvider('yunyi-a')?.apiKey, 'token-alt');
+    assert.match(String(store.getProvider('yunyi-a')?.configText || ''), /base_url = "https:\/\/example\.com\/codex"/);
+    assert.equal((store.getProvider('yunyi-a')?.authData as Record<string, unknown> | undefined)?.OPENAI_API_KEY, 'token-alt');
   });
 });

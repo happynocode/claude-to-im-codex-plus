@@ -15,6 +15,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import type { BridgeApiProvider, LLMProvider, StreamChatParams } from '../node_modules/claude-to-im/src/lib/bridge/host.js';
+import { CTI_HOME } from './config.js';
 import type { PendingPermissions } from './permission-gateway.js';
 import { sseEvent } from './sse-utils.js';
 
@@ -80,6 +81,102 @@ function resolveProviderDebugInfo(provider?: BridgeApiProvider): { providerId: s
 
   return { providerId, modelProvider, baseUrl };
 }
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function escapeTomlString(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+function formatTomlKey(value: string): string {
+  return /^[A-Za-z0-9_-]+$/.test(value) ? value : `"${escapeTomlString(value)}"`;
+}
+
+function sanitizeProviderKey(value: string): string {
+  return value.replace(/[^A-Za-z0-9._-]/g, '_');
+}
+
+function getProviderConfigText(provider?: BridgeApiProvider): string | undefined {
+  const rawConfigText = typeof provider?.configText === 'string' ? provider.configText.trim() : '';
+  if (rawConfigText) return rawConfigText + (rawConfigText.endsWith('\n') ? '' : '\n');
+
+  const modelProvider = typeof provider?.modelProvider === 'string' && provider.modelProvider.trim()
+    ? provider.modelProvider.trim()
+    : undefined;
+  const baseUrl = typeof provider?.baseUrl === 'string' && provider.baseUrl.trim()
+    ? provider.baseUrl.trim()
+    : undefined;
+  const providerName = typeof provider?.name === 'string' && provider.name.trim()
+    ? provider.name.trim()
+    : undefined;
+  if (!modelProvider && !baseUrl) return undefined;
+
+  const lines: string[] = [];
+  if (modelProvider) {
+    lines.push(`model_provider = "${escapeTomlString(modelProvider)}"`, '');
+    lines.push(`[model_providers.${formatTomlKey(modelProvider)}]`);
+  }
+  if (providerName) {
+    lines.push(`name = "${escapeTomlString(providerName)}"`);
+  }
+  if (baseUrl) {
+    lines.push(`base_url = "${escapeTomlString(baseUrl)}"`);
+  }
+  return lines.join('\n') + '\n';
+}
+function getProviderAuthData(provider?: BridgeApiProvider): Record<string, unknown> | undefined {
+  if (isRecord(provider?.authData)) {
+    return provider.authData;
+  }
+  const apiKey = typeof provider?.apiKey === 'string' && provider.apiKey.trim()
+    ? provider.apiKey.trim()
+    : undefined;
+  if (!apiKey) return undefined;
+  return {
+    OPENAI_API_KEY: apiKey,
+    auth_mode: 'apikey',
+  };
+}
+
+function buildProviderScopedEnv(provider: BridgeApiProvider | undefined, clientKey: string): Record<string, string> | undefined {
+  if (clientKey === 'env') return undefined;
+
+  const configText = getProviderConfigText(provider);
+  const authData = getProviderAuthData(provider);
+  if (!configText && !authData) return undefined;
+
+  const homeDir = path.join(CTI_HOME, 'runtime', 'codex-homes', sanitizeProviderKey(clientKey));
+  const codexDir = path.join(homeDir, '.codex');
+  fs.mkdirSync(codexDir, { recursive: true });
+
+  if (configText) {
+    fs.writeFileSync(path.join(codexDir, 'config.toml'), configText, 'utf8');
+  }
+  if (authData) {
+    fs.writeFileSync(path.join(codexDir, 'auth.json'), JSON.stringify(authData, null, 2), 'utf8');
+  }
+
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (typeof value === 'string') {
+      env[key] = value;
+    }
+  }
+  delete env.CTI_CODEX_API_KEY;
+  delete env.CODEX_API_KEY;
+  delete env.OPENAI_API_KEY;
+  delete env.CTI_CODEX_BASE_URL;
+  delete env.OPENAI_BASE_URL;
+  env.HOME = homeDir;
+  env.XDG_CONFIG_HOME = path.join(homeDir, '.config');
+  env.XDG_DATA_HOME = path.join(homeDir, '.local', 'share');
+  if (process.platform === 'win32') {
+    env.USERPROFILE = homeDir;
+  }
+  return env;
+}
 export class CodexProvider implements LLMProvider {
   private sdk: CodexModule | null = null;
   private codex: CodexInstance | null = null;
@@ -127,10 +224,13 @@ export class CodexProvider implements LLMProvider {
       ? (process.env.CTI_CODEX_BASE_URL || undefined)
       : providerBaseUrl;
 
+    const scopedEnv = buildProviderScopedEnv(provider, clientKey);
+
     const CodexClass = this.sdk.Codex;
     const codex = new CodexClass({
       ...(apiKey ? { apiKey } : {}),
       ...(baseUrl ? { baseUrl } : {}),
+      ...(scopedEnv ? { env: scopedEnv } : {}),
       ...(clientKey !== 'env' ? { config: { model_provider: providerModelProvider || clientKey } } : {}),
     });
     this.codexClients.set(clientKey, codex);
