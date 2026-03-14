@@ -9,8 +9,9 @@
 - 更强的 `/new` 会话创建参数
 - Discord 内按聊天维度配置 sandbox / approval / web search
 - 基于 `cc-switch` 的 provider 选择
+- 更稳的 provider 解析与生效值日志，方便排查 Codex 走的到底是哪条 provider
 - 在 Discord 里发现和固定 skill
-- Codex 工作过程中的更透明进度提示
+- Codex 工作过程中的更透明进度提示，包括第一句部分回复之后的长任务心跳
 
 ## 这个分支新增了什么
 
@@ -21,12 +22,16 @@
 - `/providers`、`/use-provider`、`/current-provider`、`/clear-provider`
 - `/skills`、`/use-skill`、`/current-skill`、`/clear-skill`
 - Discord 中更主动的中间进度消息，包括 thinking / tool / todo / heartbeat 更新
+- `normal` 进度模式下，长时间 Codex 工具执行不会再在第一句部分回复后突然安静
+- `verbose` 进度模式会把当前状态附加在部分回复下方，方便持续观察
 
 ### Provider 集成
 
 - 从 `~/.cc-switch/cc-switch.db` 读取 Codex providers
 - 允许按 provider 的 `id` 或 `name` 选择
+- 即使 `[model_providers.*]` 里 `name` 写在 `base_url` 前面，也能正确解析 provider
 - 为每个 provider 建立对应的 Codex SDK client，并带上匹配的 API key / base URL / model provider
+- 会把最终生效的 provider `id` / `modelProvider` / `baseUrl` 记录到 `~/.claude-to-im/logs/bridge.log`
 - 当 `cc-switch` 不可用时，回退到 `~/.codex/config.toml`
 
 ## 核心能力
@@ -86,8 +91,9 @@ npm run build
 这样你就能得到：
 
 - 来自 `cc-switch` 的 provider 选择
+- 在 `~/.claude-to-im/logs/bridge.log` 里更容易定位实际生效的 provider
 - 按聊天固定的 skill
-- Discord 里更透明的 Codex 进度提示
+- Discord 里更透明的 Codex 进度提示，即使先输出了一句文本、后面才进入长工具调用也不再静默
 
 ## Discord 命令示例
 
@@ -102,6 +108,12 @@ npm run build
 /approval on-request
 /search live
 ```
+
+进度模式：
+
+- `/progress quiet` —— 只看最终回复
+- `/progress normal` —— 默认模式；会持续显示长任务状态，但不过度刷屏
+- `/progress verbose` —— 在部分回复下方持续附加当前状态，透明度最高
 
 ## 开发
 

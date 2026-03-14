@@ -9,8 +9,9 @@ This repository keeps the original multi-platform IM bridge workflow, then adds 
 - richer `/new` session creation flags for Codex
 - per-chat sandbox / approval / web search controls in Discord
 - provider selection backed by `cc-switch`
+- safer provider parsing and effective-provider logging for Codex debugging
 - skill discovery and skill pinning from Discord
-- clearer progress transparency while Codex is still working
+- clearer progress transparency while Codex is still working, including long-running tool heartbeats after the first assistant text
 
 ## What This Fork Adds
 
@@ -21,12 +22,16 @@ This repository keeps the original multi-platform IM bridge workflow, then adds 
 - `/providers`, `/use-provider`, `/current-provider`, `/clear-provider`
 - `/skills`, `/use-skill`, `/current-skill`, `/clear-skill`
 - better intermediate progress messages in Discord, including thinking / tool / todo / heartbeat updates
+- `normal` progress mode keeps showing status during long Codex tool runs instead of going silent after the first partial reply
+- `verbose` progress mode appends the current status under the partial answer for maximum visibility
 
 ### Provider integration
 
 - reads Codex providers from `~/.cc-switch/cc-switch.db`
 - supports selecting a provider by either provider `id` or `name`
+- correctly parses provider sections even when `name` appears before `base_url`
 - creates provider-specific Codex SDK clients with the matching API key / base URL / model provider
+- logs the effective provider `id` / `modelProvider` / `baseUrl` to `~/.claude-to-im/logs/bridge.log`
 - falls back to `~/.codex/config.toml` if `cc-switch` data is unavailable
 
 ## Core Features
@@ -86,8 +91,9 @@ Build a Discord progress panel for this repo
 This gives you:
 
 - provider selection from `cc-switch`
+- clearer provider debugging in `~/.claude-to-im/logs/bridge.log`
 - pinned skill behavior per chat
-- more transparent Codex progress updates in Discord
+- more transparent Codex progress updates in Discord, even when a long tool run starts after the first streamed text
 
 ## Example Discord Commands
 
@@ -102,6 +108,12 @@ This gives you:
 /approval on-request
 /search live
 ```
+
+Progress modes:
+
+- `/progress quiet` — final replies only
+- `/progress normal` — default; keeps long-running tool status visible without flooding the chat
+- `/progress verbose` — keeps status appended under the partial answer for maximum transparency
 
 ## Development
 
